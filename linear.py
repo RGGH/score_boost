@@ -1,7 +1,48 @@
-
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 from datetime import datetime, timezone
+
+# --------------------------------------------------
+# Freshness / time-decay configuration
+# --------------------------------------------------
+
+FRESHNESS_WEIGHT = 0.15
+# Maximum amount freshness can add to the semantic score.
+# Newest possible document ≈ +0.15
+#
+# Increase → freshness matters MORE
+# Decrease → semantic relevance matters MORE
+
+
+FRESHNESS_SCALE_DAYS = 30
+# Time scale of the linear decay.
+#
+# 30 means the freshness score decays over roughly 30 days.
+#
+# Increase → papers stay "fresh" for longer
+# Decrease → papers become "old" more quickly
+
+
+FRESHNESS_MIDPOINT = 0.3
+# Controls the decay curve at the specified scale.
+#
+# At the configured scale, the decay value is calibrated
+# around this midpoint.
+#
+# Higher → slower decay
+# Lower → steeper decay
+
+
+CANDIDATE_LIMIT = 100
+# Number of semantic results considered before freshness
+# re-ranks them.
+#
+# Larger → freshness has more candidates to promote
+# Smaller → faster / less opportunity for re-ranking
+
+
+RESULT_LIMIT = 10
+# Number of final results returned.
 
 
 # --------------------------------------------------
@@ -22,6 +63,7 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 # Query
 # --------------------------------------------------
 
+
 def query(search_text):
 
     query_vector = model.encode(
@@ -37,7 +79,6 @@ def query(search_text):
     print(f"Now:   {now.isoformat()}")
     print("=" * 110)
 
-
     # --------------------------------------------------
     # Semantic-only search
     # --------------------------------------------------
@@ -48,39 +89,44 @@ def query(search_text):
         limit=100,
     )
 
-
     # --------------------------------------------------
     # Search with freshness formula
     # --------------------------------------------------
 
     formula_result = client.query_points(
         collection_name=COLLECTION_NAME,
-
         prefetch=models.Prefetch(
             query=query_vector,
             limit=100,
         ),
-
         query=models.FormulaQuery(
             formula=models.SumExpression(
                 sum=[
+                    # --------------------------------------------------
+                    # Original semantic similarity score
+                    # --------------------------------------------------
                     "$score",
-
+                    # --------------------------------------------------
+                    # Freshness boost
+                    #
+                    # freshness_score × FRESHNESS_WEIGHT
+                    # --------------------------------------------------
                     models.MultExpression(
                         mult=[
-                            0.15,
-
+                            FRESHNESS_WEIGHT,
                             models.LinDecayExpression(
                                 lin_decay=models.DecayParamsExpression(
+                                    # Payload field containing the
+                                    # publication Unix timestamp
                                     x="published_timestamp",
-
+                                    # "Now" = reference point for age
                                     target=models.DatetimeExpression(
                                         datetime=now.isoformat(),
                                     ),
-
-                                    scale=30 * 86400,
-
-                                    midpoint=0.3,
+                                    # How quickly freshness decays
+                                    scale=FRESHNESS_SCALE_DAYS * 86400,
+                                    # Shape/calibration of the decay
+                                    midpoint=FRESHNESS_MIDPOINT,
                                 )
                             ),
                         ]
@@ -88,20 +134,14 @@ def query(search_text):
                 ]
             )
         ),
-
-        limit=10,
+        limit=RESULT_LIMIT,
     )
-
 
     # --------------------------------------------------
     # Original semantic scores
     # --------------------------------------------------
 
-    semantic_scores = {
-        point.id: point.score
-        for point in semantic_result.points
-    }
-
+    semantic_scores = {point.id: point.score for point in semantic_result.points}
 
     # --------------------------------------------------
     # Print results
@@ -111,7 +151,6 @@ def query(search_text):
     print("=" * 110)
 
     for rank, point in enumerate(formula_result.points, start=1):
-
         # payload = point.payload
         payload = point.payload or {}
 
@@ -133,12 +172,9 @@ def query(search_text):
         timestamp = payload.get("published_timestamp")
 
         if timestamp is not None:
-            age_days = (
-                now.timestamp() - float(timestamp)
-            ) / 86400
+            age_days = (now.timestamp() - float(timestamp)) / 86400
         else:
             age_days = None
-
 
         print(f"\n#{rank} {freshness_indicator}")
         print("-" * 110)
@@ -157,6 +193,7 @@ def query(search_text):
 
         print(f"arXiv:             {payload.get('arxiv_id', 'N/A')}")
         print(f"URL:               {payload.get('url', 'N/A')}")
+
 
 if __name__ == "__main__":
     search_text = input("Search: ")
