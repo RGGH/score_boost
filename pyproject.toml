@@ -1,0 +1,14 @@
+[project]
+name = "score-boost"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bs4>=0.0.2",
+    "lxml>=6.1.2",
+    "pandas>=3.0.5",
+    "qdrant-client>=1.19.0",
+    "requests>=2.34.2",
+    "sentence-transformers>=6.0.0",
+]
