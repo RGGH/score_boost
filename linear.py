@@ -16,6 +16,9 @@ FRESHNESS_WEIGHT = 0.15
 
 FRESHNESS_SCALE_DAYS = 30
 # Time scale of the linear decay.
+# the *reference distance* for shaping the decay
+# It does not mean:
+# "At day 30, turn the boost off."
 #
 # 30 means the freshness score decays over roughly 30 days.
 #
