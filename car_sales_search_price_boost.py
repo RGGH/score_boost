@@ -5,9 +5,6 @@ from sentence_transformers import SentenceTransformer
 # Price-proximity boost configuration
 # --------------------------------------------------
 
-PRICE_WEIGHT = 0.20
-# Maximum amount price-proximity can add to the semantic score.
-
 PRICE_SCALE_PCT = 0.10
 # Scale is now a PERCENTAGE of target_price rather than a fixed
 # currency amount. A fixed £ scale doesn't generalize across a wide
@@ -31,6 +28,59 @@ PRICE_EXPONENT = 6.0
 # about target_price - being £X over budget is penalized identically
 # to being £X under. Raised from 4.0 to 6.0 for a sharper peak and
 # thinner tails, so only genuinely close matches get real credit.
+
+
+# --------------------------------------------------
+# Mileage boost configuration
+# --------------------------------------------------
+#
+# Embeddings don't reason about numbers - "Mileage: 46220 miles" vs
+# "Mileage: 105646 miles" are just different tokens to the model, not
+# a comparison of magnitude. So a query like "low mileage hatchback"
+# gets essentially no semantic signal from mileage at all. This boost
+# pulls that constraint out of free text and into explicit logic.
+#
+# Unlike price, mileage isn't "close to a target" - it's "as low as
+# possible". Reusing symmetric_rational_decay with target=0 gives
+# exactly that: since mileage can't go negative, the curve only ever
+# gets evaluated on one side, so it acts as a pure monotonic
+# "lower is better" decay rather than a two-sided closeness match.
+
+MILEAGE_SCALE = 50000.0
+# Mileage at which the boost has dropped to MILEAGE_MIDPOINT. Widened
+# from 20000 - that was too tight for this dataset (mileage ranges
+# roughly 6.5k-210k miles), so only near-new cars under ~15k miles
+# got any real credit at all; everything else rounded to ~zero.
+# 50000 gives a much more usable spread across the actual inventory.
+
+MILEAGE_MIDPOINT = 0.15
+
+MILEAGE_EXPONENT = 4.0
+# Softened from 6.0 to 4.0 to match the wider scale - keeps the
+# falloff meaningful without being a near step-function.
+
+
+# --------------------------------------------------
+# Combined boost weight
+# --------------------------------------------------
+#
+# IMPORTANT: price and mileage factors are MULTIPLIED together, not
+# summed. Each factor is already in [0, 1] ("how well this result
+# satisfies this constraint"). Multiplying means a result has to be
+# reasonably good on EVERY active constraint to get real credit - if
+# either factor collapses toward 0, the whole boost collapses toward
+# 0, regardless of how well it scores on the other one.
+#
+# This matters because additive boosts let a result "buy" a top rank
+# by maxing out a single dimension while completely failing another
+# (e.g. a car 9x over budget still ranking #1 purely because its
+# mileage was very low). Multiplicative gating prevents that: no
+# single dimension can compensate for failing a different one.
+
+BOOST_WEIGHT = 0.20
+# Maximum amount the combined constraint-satisfaction boost can add
+# to the semantic score (when every active constraint is perfectly
+# satisfied, i.e. all factors == 1.0).
 
 
 # --------------------------------------------------
@@ -137,7 +187,7 @@ def symmetric_rational_decay(
 # --------------------------------------------------
 
 
-def query(search_text, target_price: float | None = None):
+def query(search_text, target_price: float | None = None, prioritize_low_mileage: bool = False):
 
     query_vector = model.encode(
         search_text,
@@ -150,6 +200,8 @@ def query(search_text, target_price: float | None = None):
     if target_price is not None:
         price_scale_preview = max(target_price * PRICE_SCALE_PCT, MIN_PRICE_SCALE)
         print(f"Target price: {target_price}  (scale window: ±{price_scale_preview:.2f})")
+    if prioritize_low_mileage:
+        print(f"Prioritizing low mileage (scale: {MILEAGE_SCALE:.0f} miles)")
     print("=" * 110)
 
     # --------------------------------------------------
@@ -163,10 +215,10 @@ def query(search_text, target_price: float | None = None):
     )
 
     # --------------------------------------------------
-    # Build the boosted formula: semantic [+ price proximity]
+    # Build the boosted formula: semantic + BOOST_WEIGHT * (factors multiplied together)
     # --------------------------------------------------
 
-    boost_terms = ["$score"]
+    constraint_factors = []
 
     if target_price is not None:
         # Scale is a percentage of target_price (with a floor), so
@@ -174,19 +226,35 @@ def query(search_text, target_price: float | None = None):
         # being searched for instead of a one-size-fits-all £ amount.
         price_scale = max(target_price * PRICE_SCALE_PCT, MIN_PRICE_SCALE)
 
-        boost_terms.append(
-            models.MultExpression(
-                mult=[
-                    PRICE_WEIGHT,
-                    symmetric_rational_decay(
-                        x_field="price",
-                        target=target_price,
-                        scale=price_scale,
-                        midpoint=PRICE_MIDPOINT,
-                        exponent=PRICE_EXPONENT,
-                    ),
-                ]
+        constraint_factors.append(
+            symmetric_rational_decay(
+                x_field="price",
+                target=target_price,
+                scale=price_scale,
+                midpoint=PRICE_MIDPOINT,
+                exponent=PRICE_EXPONENT,
             )
+        )
+
+    if prioritize_low_mileage:
+        constraint_factors.append(
+            symmetric_rational_decay(
+                x_field="mileage",
+                target=0.0,
+                scale=MILEAGE_SCALE,
+                midpoint=MILEAGE_MIDPOINT,
+                exponent=MILEAGE_EXPONENT,
+            )
+        )
+
+    boost_terms = ["$score"]
+
+    if constraint_factors:
+        # Multiplying (not summing) the factors means every active
+        # constraint must be reasonably satisfied - failing one
+        # can't be masked by acing another.
+        boost_terms.append(
+            models.MultExpression(mult=[BOOST_WEIGHT, *constraint_factors])
         )
 
     formula_result = client.query_points(
@@ -229,11 +297,11 @@ def query(search_text, target_price: float | None = None):
         final_score = point.score
 
         if semantic_score is not None:
-            boost = final_score - semantic_score
+            total_boost = final_score - semantic_score
         else:
-            boost = 0.0
+            total_boost = 0.0
 
-        boost_indicator = "🟢" if boost > 0.000001 else ""
+        boost_indicator = "🟢" if total_boost > 0.000001 else ""
 
         print(f"\n#{rank} {boost_indicator}")
         print("-" * 110)
@@ -243,18 +311,43 @@ def query(search_text, target_price: float | None = None):
         print(f"Engine size:       {engine_size}")
         print(f"Fuel type:         {fuel_type}")
         print(f"Year:              {year}")
-        print(f"Mileage:           {mileage}")
 
-        if price is not None:
-            price_diff = (
-                f" (Δ {abs(price - target_price):.2f} from target)"
-                if target_price is not None
-                else ""
+        mileage_factor = None
+        if prioritize_low_mileage and isinstance(mileage, (int, float)):
+            mileage_factor = 1 / (
+                1
+                + ((1 - MILEAGE_MIDPOINT) / MILEAGE_MIDPOINT)
+                * (mileage / MILEAGE_SCALE) ** MILEAGE_EXPONENT
             )
+            print(f"Mileage:           {mileage}  (factor: {mileage_factor:.4f})")
+        else:
+            print(f"Mileage:           {mileage}")
+
+        price_factor = None
+        if price is not None:
+            price_diff = ""
+            if target_price is not None:
+                price_scale = max(target_price * PRICE_SCALE_PCT, MIN_PRICE_SCALE)
+                price_factor = 1 / (
+                    1
+                    + ((1 - PRICE_MIDPOINT) / PRICE_MIDPOINT)
+                    * (abs(price - target_price) / price_scale) ** PRICE_EXPONENT
+                )
+                price_diff = (
+                    f" (Δ {abs(price - target_price):.2f} from target, "
+                    f"factor: {price_factor:.4f})"
+                )
             print(f"Price:             {price}{price_diff}")
 
+        if price_factor is not None or mileage_factor is not None:
+            combined = 1.0
+            for f in (price_factor, mileage_factor):
+                if f is not None:
+                    combined *= f
+            print(f"Combined factor:   {combined:.6f}  (all active constraints multiplied)")
+
         print(f"Semantic score:    {semantic_score:.6f}")
-        print(f"Price boost:       {boost:.6f}")
+        print(f"Total boost:       {total_boost:.6f}")
         print(f"FINAL score:       {final_score:.6f}")
 
 
@@ -262,4 +355,23 @@ if __name__ == "__main__":
     search_text = input("Search: ")
     price_input = input("Target price (blank to skip): ").strip()
     target_price = float(price_input) if price_input else None
-    query(search_text, target_price=target_price)
+    mileage_input = input("Prioritize low mileage? (y/N): ").strip().lower()
+    prioritize_low_mileage = mileage_input == "y"
+    query(
+        search_text,
+        target_price=target_price,
+        prioritize_low_mileage=prioritize_low_mileage,
+    )
+
+"""
+Why not just use filters?
+-------------------------
+Filters are binary — a £5,001 car and a £50,000 car are equally "excluded" if the cutoff is £5,000, 
+and you lose them entirely even if nothing else matches better. 
+Score boosting keeps every candidate in play but prefers closeness, s
+o a near-miss on price with a great semantic match can still surface, 
+just ranked lower — instead of vanishing outright. 
+Filters are the right tool for hard constraints (must be a hatchback); 
+boosting is for soft preferences (would like it near £5k) where you want graceful tradeoffs, 
+not a cliff edge.
+"""

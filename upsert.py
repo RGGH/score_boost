@@ -53,6 +53,7 @@ if not client.collection_exists(COLLECTION_NAME):
 # 5. Convert 'published' date to Unix timestamp
 # --------------------------------------------------
 
+
 def to_timestamp(value) -> float | None:
     """
     Convert an ISO date/time string to a Unix timestamp.
@@ -81,9 +82,12 @@ def to_timestamp(value) -> float | None:
 # --------------------------------------------------
 
 texts = (
-    "Title: " + df["title"].astype(str)
-    + "\nDescription: " + df["description"].astype(str)
-    + "\nAbstract: " + df["abstract"].astype(str)
+    "Title: "
+    + df["title"].astype(str)
+    + "\nDescription: "
+    + df["description"].astype(str)
+    + "\nAbstract: "
+    + df["abstract"].astype(str)
 ).tolist()
 
 
@@ -105,7 +109,6 @@ embeddings = model.encode(
 points = []
 
 for i, row in enumerate(df.to_dict(orient="records")):
-
     published_timestamp = to_timestamp(row["published"])
 
     payload = {
@@ -148,4 +151,3 @@ client.upsert(
 # --------------------------------------------------
 
 print(f"Uploaded {len(points)} papers to Qdrant.")
-
