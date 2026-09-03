@@ -1,135 +1,68 @@
-from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
+import streamlit as st
+import pandas as pd
 from datetime import datetime, timezone
 
-# --------------------------------------------------
-# Freshness / time-decay configuration
-# --------------------------------------------------
+from qdrant_client import QdrantClient, models
+from sentence_transformers import SentenceTransformer
 
-FRESHNESS_WEIGHT = 0.15
-# Maximum amount freshness can add to the semantic score.
-# Newest possible document ≈ +0.15
-#
-# Increase → freshness matters MORE
-# Decrease → semantic relevance matters MORE
-
-
-FRESHNESS_SCALE_DAYS = 30
-# Time scale of the linear decay.
-# the *reference distance* for shaping the decay
-# It does not mean:
-# "At day 30, turn the boost off."
-#
-# 30 means the freshness score decays over roughly 30 days.
-#
-# Increase → papers stay "fresh" for longer
-# Decrease → papers become "old" more quickly
-
-
-FRESHNESS_MIDPOINT = 0.3
-# Controls the decay curve at the specified scale.
-#
-# At the configured scale, the decay value is calibrated
-# around this midpoint.
-#
-# Higher → slower decay
-# Lower → steeper decay
-
-
-CANDIDATE_LIMIT = 100
-# Number of semantic results considered before freshness
-# re-ranks them.
-#
-# Larger → freshness has more candidates to promote
-# Smaller → faster / less opportunity for re-ranking
-
-
-RESULT_LIMIT = 10
-# Number of final results returned.
-
+st.set_page_config(page_title="Freshness-Aware Semantic Search", layout="wide")
 
 # --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-
-COLLECTION_NAME = "arxiv_papers"
-
-client = QdrantClient(
-    host="localhost",
-    port=6333,
-)
-
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-
-# --------------------------------------------------
-# Query
+# Cached resources (loaded once, reused across runs)
 # --------------------------------------------------
 
 
-def query(search_text):
+@st.cache_resource
+def get_client(host, port):
+    return QdrantClient(host=host, port=port)
 
-    query_vector = model.encode(
-        search_text,
-        normalize_embeddings=True,
-    ).tolist()
 
+@st.cache_resource
+def get_model(name):
+    return SentenceTransformer(name)
+
+
+# --------------------------------------------------
+# Core query logic (same behavior as the CLI script)
+# --------------------------------------------------
+
+
+def run_query(
+    client,
+    model,
+    collection_name,
+    search_text,
+    freshness_weight,
+    freshness_scale_days,
+    freshness_midpoint,
+    candidate_limit,
+    result_limit,
+):
+    query_vector = model.encode(search_text, normalize_embeddings=True).tolist()
     now = datetime.now(timezone.utc)
 
-    print()
-    print("=" * 110)
-    print(f"Query: {search_text}")
-    print(f"Now:   {now.isoformat()}")
-    print("=" * 110)
-
-    # --------------------------------------------------
-    # Semantic-only search
-    # --------------------------------------------------
-
     semantic_result = client.query_points(
-        collection_name=COLLECTION_NAME,
+        collection_name=collection_name,
         query=query_vector,
-        limit=100,
+        limit=candidate_limit,
     )
 
-    # --------------------------------------------------
-    # Search with freshness formula
-    # --------------------------------------------------
-
     formula_result = client.query_points(
-        collection_name=COLLECTION_NAME,
-        prefetch=models.Prefetch(
-            query=query_vector,
-            limit=100,
-        ),
+        collection_name=collection_name,
+        prefetch=models.Prefetch(query=query_vector, limit=candidate_limit),
         query=models.FormulaQuery(
             formula=models.SumExpression(
                 sum=[
-                    # --------------------------------------------------
-                    # Original semantic similarity score
-                    # --------------------------------------------------
                     "$score",
-                    # --------------------------------------------------
-                    # Freshness boost
-                    #
-                    # freshness_score × FRESHNESS_WEIGHT
-                    # --------------------------------------------------
                     models.MultExpression(
                         mult=[
-                            FRESHNESS_WEIGHT,
+                            freshness_weight,
                             models.LinDecayExpression(
                                 lin_decay=models.DecayParamsExpression(
-                                    # Payload field containing the
-                                    # publication Unix timestamp
                                     x="published_timestamp",
-                                    # "Now" = reference point for age
-                                    target=models.DatetimeExpression(
-                                        datetime=now.isoformat(),
-                                    ),
-                                    # How quickly freshness decays
-                                    scale=FRESHNESS_SCALE_DAYS * 86400,
-                                    # Shape/calibration of the decay
-                                    midpoint=FRESHNESS_MIDPOINT,
+                                    target=models.DatetimeExpression(datetime=now.isoformat()),
+                                    scale=freshness_scale_days * 86400,
+                                    midpoint=freshness_midpoint,
                                 )
                             ),
                         ]
@@ -137,24 +70,13 @@ def query(search_text):
                 ]
             )
         ),
-        limit=RESULT_LIMIT,
+        limit=result_limit,
     )
-
-    # --------------------------------------------------
-    # Original semantic scores
-    # --------------------------------------------------
 
     semantic_scores = {point.id: point.score for point in semantic_result.points}
 
-    # --------------------------------------------------
-    # Print results
-    # --------------------------------------------------
-
-    print("\nFINAL RESULTS")
-    print("=" * 110)
-
+    rows = []
     for rank, point in enumerate(formula_result.points, start=1):
-        # payload = point.payload
         payload = point.payload or {}
 
         title = payload.get("title", "N/A")
@@ -162,42 +84,133 @@ def query(search_text):
 
         semantic_score = semantic_scores.get(point.id)
         final_score = point.score
+        freshness_boost = (final_score - semantic_score) if semantic_score is not None else 0.0
 
-        if semantic_score is not None:
-            freshness_boost = final_score - semantic_score
-        else:
-            freshness_boost = 0.0
-
-        # Green tick if freshness contributed anything
-        freshness_indicator = "🟢" if freshness_boost > 0.000001 else ""
-
-        # Calculate age for display
         timestamp = payload.get("published_timestamp")
+        age_days = (now.timestamp() - float(timestamp)) / 86400 if timestamp is not None else None
 
-        if timestamp is not None:
-            age_days = (now.timestamp() - float(timestamp)) / 86400
-        else:
-            age_days = None
+        rows.append(
+            {
+                "Rank": rank,
+                "🟢": "🟢" if freshness_boost > 1e-6 else "",
+                "Title": title,
+                "Published": published,
+                "Age (days)": round(age_days, 1) if age_days is not None else None,
+                "Semantic score": round(semantic_score, 6) if semantic_score is not None else None,
+                "Freshness boost": round(freshness_boost, 6),
+                "Final score": round(final_score, 6),
+                "arXiv": payload.get("arxiv_id", "N/A"),
+                "URL": payload.get("url", "N/A"),
+            }
+        )
 
-        print(f"\n#{rank} {freshness_indicator}")
-        print("-" * 110)
-
-        print(f"Title:             {title}")
-        print(f"Published:         {published}")
-
-        if age_days is not None:
-            print(f"Age:               {age_days:.1f} days")
-        else:
-            print("Age:               N/A")
-
-        print(f"Semantic score:    {semantic_score:.6f}")
-        print(f"Freshness boost:   {freshness_boost:.6f}")
-        print(f"FINAL score:       {final_score:.6f}")
-
-        print(f"arXiv:             {payload.get('arxiv_id', 'N/A')}")
-        print(f"URL:               {payload.get('url', 'N/A')}")
+    return pd.DataFrame(rows), now
 
 
-if __name__ == "__main__":
-    search_text = input("Search: ")
-    query(search_text)
+# --------------------------------------------------
+# Sidebar: connection + constants as sliders
+# --------------------------------------------------
+
+st.sidebar.header("Connection")
+host = st.sidebar.text_input("Qdrant host", value="localhost")
+port = st.sidebar.number_input("Qdrant port", value=6333, step=1)
+collection_name = st.sidebar.text_input("Collection name", value="arxiv_papers")
+model_name = st.sidebar.text_input("Embedding model", value="all-MiniLM-L6-v2")
+
+st.sidebar.header("Freshness / decay constants")
+
+freshness_weight = st.sidebar.slider(
+    "FRESHNESS_WEIGHT",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.15,
+    step=0.01,
+    help="Max amount freshness can add to the semantic score. Higher = freshness matters more.",
+)
+
+freshness_scale_days = st.sidebar.slider(
+    "FRESHNESS_SCALE_DAYS",
+    min_value=1,
+    max_value=365,
+    value=30,
+    step=1,
+    help="Reference time scale of the decay. Higher = papers stay 'fresh' longer.",
+)
+
+freshness_midpoint = st.sidebar.slider(
+    "FRESHNESS_MIDPOINT",
+    min_value=0.01,
+    max_value=0.99,
+    value=0.30,
+    step=0.01,
+    help="Decay value at the configured scale. Higher = slower decay, lower = steeper decay.",
+)
+
+candidate_limit = st.sidebar.slider(
+    "CANDIDATE_LIMIT",
+    min_value=10,
+    max_value=500,
+    value=100,
+    step=10,
+    help="Number of semantic results considered before freshness re-ranks them.",
+)
+
+result_limit = st.sidebar.slider(
+    "RESULT_LIMIT",
+    min_value=1,
+    max_value=50,
+    value=10,
+    step=1,
+    help="Number of final results returned.",
+)
+
+# --------------------------------------------------
+# Main panel
+# --------------------------------------------------
+
+st.title("🔎 Freshness-Aware Semantic Search")
+st.caption("Semantic search over arXiv papers with a tunable recency boost, backed by Qdrant.")
+
+search_text = st.text_input("Search query", placeholder="e.g. reinforcement learning from human feedback")
+search_clicked = st.button("Search", type="primary")
+
+if search_clicked:
+    if not search_text.strip():
+        st.warning("Enter a search query first.")
+    else:
+        try:
+            with st.spinner("Loading model and connecting to Qdrant..."):
+                client = get_client(host, port)
+                model = get_model(model_name)
+
+            with st.spinner("Running search..."):
+                df, now = run_query(
+                    client,
+                    model,
+                    collection_name,
+                    search_text,
+                    freshness_weight,
+                    freshness_scale_days,
+                    freshness_midpoint,
+                    candidate_limit,
+                    result_limit,
+                )
+
+            st.caption(f"Query time (UTC): {now.isoformat()}")
+
+            if df.empty:
+                st.info("No results found.")
+            else:
+                st.dataframe(
+                    df,
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "URL": st.column_config.LinkColumn("URL"),
+                    },
+                )
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+else:
+    st.info("Set your query and constants, then click **Search**.")
+

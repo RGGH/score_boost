@@ -11,4 +11,5 @@ dependencies = [
     "qdrant-client>=1.19.0",
     "requests>=2.34.2",
     "sentence-transformers>=6.0.0",
+    "streamlit>=1.63.0",
 ]
